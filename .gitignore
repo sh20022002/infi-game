@@ -1,0 +1,11 @@
+# API keys and private config
+scripts/config.json
+
+# Auto-generated progress (contains local file paths)
+scripts/.progress.json
+
+# Generated question data (rebuilt by the script)
+data/generated-topics-data.json
+
+# Node dependencies
+scripts/node_modules/

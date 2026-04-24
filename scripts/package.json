@@ -1,0 +1,13 @@
+{
+  "name": "infi-game-question-generator",
+  "version": "1.0.0",
+  "description": "Generate Calculus I game questions from PDF textbooks using Claude",
+  "main": "generate-questions.js",
+  "scripts": {
+    "generate": "node generate-questions.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "pdf-parse": "^1.1.1"
+  }
+}
