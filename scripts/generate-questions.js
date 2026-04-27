@@ -20,6 +20,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 const fs = require('fs');
 const path = require('path');
 const pdfParse = require('pdf-parse');
+const { jsonrepair } = require('jsonrepair');
 
 const ROOT_DIR = path.join(__dirname, '..');
 const PROGRESS_FILE = path.join(__dirname, '.progress.json');
@@ -32,10 +33,11 @@ function loadConfig() {
   return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
 }
 
-// Claude Sonnet 4.6 has a 200K token context window.
-// We use at most 35% of that for PDF text per call → well under the 50% limit.
+// Claude Sonnet 4.6 has a 200K token context window, but the free tier
+// rate-limits to 30K input tokens/minute. We keep chunks under 25K so each
+// call (chunk + system prompt + wrapper) stays well within that limit.
 const MAX_CONTEXT_TOKENS = 200_000;
-const CHUNK_TOKEN_BUDGET = Math.floor(MAX_CONTEXT_TOKENS * 0.35); // ~70K tokens
+const CHUNK_TOKEN_BUDGET = 25_000;
 const MAX_OUTPUT_TOKENS = 8_192;
 
 // Rough estimator: 1 token ≈ 4 characters
@@ -149,11 +151,30 @@ The game supports four question types:
   Required fields: answer (short string), hint (string)
 
 Every question also needs: type, prompt, explanation (Hebrew, explains the correct answer).
+• proof.statement MUST be a complete LaTeX expression wrapped in $...$ (e.g. "$\\lim_{x\\to a}f(x)=L$"). Never output raw LaTeX without dollar-sign delimiters.
 
 Rules:
 - All text (prompt, choices, hint, explanation, title, sub, idea) must be in Hebrew.
 - Use LaTeX for mathematics: $\\varepsilon > 0$, $\\lim_{x \\to a} f(x)$, etc.
 - Return ONLY a valid JSON array — no prose, no markdown fences.`;
+
+async function withRetry(fn, label) {
+  const delays = [60, 90, 120];
+  for (let attempt = 0; attempt <= delays.length; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isRateLimit = err.status === 429 || (err.message && err.message.includes('rate_limit'));
+      if (isRateLimit && attempt < delays.length) {
+        const wait = delays[attempt];
+        console.log(`      Rate limit hit — waiting ${wait}s before retry ${attempt + 1}/${delays.length}...`);
+        await new Promise(r => setTimeout(r, wait * 1000));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
 
 async function generateQuestions(client, chunk) {
   const prompt = `Based on the following textbook excerpt, create 4–6 game questions that cover the main mathematical concepts.
@@ -179,19 +200,19 @@ Return a JSON array of topic objects in this exact shape:
 TEXTBOOK EXCERPT:
 ${chunk}`;
 
-  const response = await client.messages.create({
+  const response = await withRetry(() => client.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: MAX_OUTPUT_TOKENS,
     system: GENERATION_SYSTEM,
     messages: [{ role: 'user', content: prompt }],
-  });
+  }), 'generation');
 
   const raw = response.content[0].text.trim();
   const match = raw.match(/\[[\s\S]*\]/);
   if (!match) throw new Error('Generation response contained no JSON array');
 
   return {
-    topics: JSON.parse(match[0]),
+    topics: JSON.parse(jsonrepair(match[0])),
     inputTokens: response.usage?.input_tokens ?? estimateTokens(prompt),
   };
 }
@@ -213,26 +234,26 @@ Return ONLY the corrected JSON array — no prose, no markdown fences.`;
 async function validateQuestions(client, topics) {
   const prompt = `Validate and fix these Calculus I game questions. Return only the corrected JSON array.\n\n${JSON.stringify(topics, null, 2)}`;
 
-  const response = await client.messages.create({
+  const response = await withRetry(() => client.messages.create({
     model: 'claude-sonnet-4-6',
     max_tokens: MAX_OUTPUT_TOKENS,
     system: VALIDATION_SYSTEM,
     messages: [{ role: 'user', content: prompt }],
-  });
+  }), 'validation');
 
   const raw = response.content[0].text.trim();
   const match = raw.match(/\[[\s\S]*\]/);
   if (!match) throw new Error('Validation response contained no JSON array');
 
   return {
-    topics: JSON.parse(match[0]),
+    topics: JSON.parse(jsonrepair(match[0])),
     inputTokens: response.usage?.input_tokens ?? estimateTokens(prompt),
   };
 }
 
 // ─── Core processing ─────────────────────────────────────────────────────────
 
-async function processFile(pdfPath, startChunkIndex) {
+async function processFile(pdfPath, startChunkIndex, pdfIndex) {
   const client = new Anthropic();
 
   console.log(`Reading PDF: ${path.basename(pdfPath)}`);
@@ -294,16 +315,19 @@ async function processFile(pdfPath, startChunkIndex) {
   if (remaining > 0) {
     saveProgress({
       sourceFile: pdfPath,
+      pdfIndex,
       totalChunks: chunks.length,
       nextChunkIndex: next,
       lastProcessedAt: new Date().toISOString(),
       remaining,
     });
-    console.log(`\nProgress saved. ${remaining} chunk(s) remaining.`);
-    console.log(`Run "node generate-questions.js" (no args) to process chunk ${next + 1}/${chunks.length}.`);
+    console.log(`\nProgress saved. ${remaining} chunk(s) remaining in this book.`);
+    console.log(`Run "node generate-questions.js" to process chunk ${next + 1}/${chunks.length}.`);
+    return false;
   } else {
-    console.log('\nAll chunks processed for this file!');
+    console.log('\nAll chunks processed for this book!');
     clearProgress();
+    return true;
   }
 }
 
@@ -318,6 +342,34 @@ async function main() {
     process.env.ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || config.apiKey;
   }
 
+  // Resolve the list of PDFs from config (supports both pdfPaths array and legacy pdfPath)
+  const pdfPaths = config.pdfPaths
+    ? config.pdfPaths
+    : config.pdfPath ? [config.pdfPath] : [];
+
+  function advanceToNextBook(currentIndex) {
+    const nextIndex = currentIndex + 1;
+    if (!pdfPaths[nextIndex]) {
+      console.log('\nAll books fully processed!');
+      return;
+    }
+    const nextPath = path.resolve(pdfPaths[nextIndex]);
+    if (!fs.existsSync(nextPath)) {
+      console.error(`\nNext book not found: ${nextPath}`);
+      return;
+    }
+    saveProgress({
+      sourceFile: nextPath,
+      pdfIndex: nextIndex,
+      totalChunks: null,
+      nextChunkIndex: 0,
+      lastProcessedAt: new Date().toISOString(),
+      remaining: null,
+    });
+    console.log(`\nBook ${nextIndex + 1}/${pdfPaths.length} queued: ${path.basename(nextPath)}`);
+    console.log('Run "node generate-questions.js" to start it.');
+  }
+
   if (args.length > 0) {
     // Explicit path passed on the command line
     const pdfPath = path.resolve(args[0]);
@@ -329,39 +381,45 @@ async function main() {
       console.error('Argument must be a .pdf file');
       process.exit(1);
     }
-    await processFile(pdfPath, 0);
+    await processFile(pdfPath, 0, 0);
 
   } else {
-    // No argument — try resuming progress, then fall back to config.json pdfPath
+    // No argument — resume progress or start the first book
     const progress = loadProgress();
 
     if (progress) {
       if (!fs.existsSync(progress.sourceFile)) {
         console.error(`Saved PDF no longer exists: ${progress.sourceFile}`);
-        console.error('Update pdfPath in scripts/config.json and run again.');
+        console.error('Update pdfPaths in scripts/config.json and run again.');
         clearProgress();
         process.exit(1);
       }
-      console.log(`Resuming: ${path.basename(progress.sourceFile)}`);
-      console.log(`Progress: chunk ${progress.nextChunkIndex + 1}/${progress.totalChunks}  (${progress.remaining} remaining)`);
-      console.log(`Last run: ${progress.lastProcessedAt}`);
-      await processFile(progress.sourceFile, progress.nextChunkIndex);
+      const pdfIndex = progress.pdfIndex ?? 0;
+      const bookLabel = pdfPaths.length > 1 ? `book ${pdfIndex + 1}/${pdfPaths.length} — ` : '';
+      console.log(`Resuming: ${bookLabel}${path.basename(progress.sourceFile)}`);
+      if (progress.totalChunks) {
+        console.log(`Progress: chunk ${progress.nextChunkIndex + 1}/${progress.totalChunks}  (${progress.remaining} remaining)`);
+        console.log(`Last run: ${progress.lastProcessedAt}`);
+      }
+      const done = await processFile(progress.sourceFile, progress.nextChunkIndex, pdfIndex);
+      if (done) advanceToNextBook(pdfIndex);
 
-    } else if (config.pdfPath && config.pdfPath !== 'C:/Users/shmue/Downloads/your-textbook.pdf') {
-      // Fresh start using path from config.json
-      const pdfPath = path.resolve(config.pdfPath);
+    } else if (pdfPaths.length > 0) {
+      const pdfPath = path.resolve(pdfPaths[0]);
       if (!fs.existsSync(pdfPath)) {
-        console.error(`PDF from config.json not found: ${pdfPath}`);
-        console.error('Edit pdfPath in scripts/config.json');
+        console.error(`PDF not found: ${pdfPath}`);
+        console.error('Edit pdfPaths in scripts/config.json');
         process.exit(1);
       }
-      console.log(`Starting from config.json: ${path.basename(pdfPath)}`);
-      await processFile(pdfPath, 0);
+      const bookLabel = pdfPaths.length > 1 ? `book 1/${pdfPaths.length} — ` : '';
+      console.log(`Starting ${bookLabel}${path.basename(pdfPath)}`);
+      const done = await processFile(pdfPath, 0, 0);
+      if (done) advanceToNextBook(0);
 
     } else {
       console.error('Nothing to do. Either:');
-      console.error('  1. Edit pdfPath in scripts/config.json, then run: node generate-questions.js');
-      console.error('  2. Pass the path directly:              node generate-questions.js path/to/file.pdf');
+      console.error('  1. Set pdfPaths in scripts/config.json, then run: node generate-questions.js');
+      console.error('  2. Pass the path directly:                         node generate-questions.js path/to/file.pdf');
       process.exit(1);
     }
   }

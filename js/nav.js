@@ -31,8 +31,10 @@ function openTopic(id) {
   const topic = TOPICS.find(t => t.id === id);
   state.topicId = id;
   document.getElementById('topic-title').textContent = topic.icon + ' ' + topic.title;
+  const stmt = topic.proof.statement;
+  const wrappedStmt = stmt.includes('$') ? stmt : `$$${stmt}$$`;
   document.getElementById('topic-desc').innerHTML =
-    `<p style="margin-bottom:8px"><strong style="color:#fff">משפט:</strong> ${topic.proof.statement}</p>
+    `<p style="margin-bottom:8px"><strong style="color:#fff">משפט:</strong> ${wrappedStmt}</p>
      <p style="color:var(--muted);font-size:.88rem;margin-top:6px">💡 <strong>רעיון:</strong> ${topic.proof.idea}</p>`;
   const modeLabels = { order:'🔀 סדר שלבים', mcq:'❓ רב-ברירה', tf:'✅ נכון/שקר', fill:'✏️ מלא חסר' };
   document.getElementById('mode-row').innerHTML = topic.modes.map((m, i) =>
