@@ -308,6 +308,14 @@ async function processFile(pdfPath, startChunkIndex, pdfIndex) {
   const savedN = valResult.topics.reduce((s, t) => s + t.questions.length, 0);
   console.log(`Saved ${savedN} questions.`);
 
+  // ── Step 3b: Consolidate duplicates ─────────────────────────────────────────
+  try {
+    require('./consolidate-topics');
+    console.log('Consolidation complete.');
+  } catch (err) {
+    console.warn('Consolidation skipped:', err.message);
+  }
+
   // ── Step 4: Update progress ──────────────────────────────────────────────────
   const next = startChunkIndex + 1;
   const remaining = chunks.length - next;
