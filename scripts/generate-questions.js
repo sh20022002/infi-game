@@ -351,6 +351,7 @@ async function main() {
     const nextIndex = currentIndex + 1;
     if (!pdfPaths[nextIndex]) {
       console.log('\nAll books fully processed!');
+      saveProgress({ allDone: true, lastProcessedAt: new Date().toISOString() });
       return;
     }
     const nextPath = path.resolve(pdfPaths[nextIndex]);
@@ -388,6 +389,12 @@ async function main() {
     const progress = loadProgress();
 
     if (progress) {
+      if (progress.allDone) {
+        console.log('All PDFs in config.json have already been processed.');
+        console.log('To process new PDFs, add them to pdfPaths in config.json.');
+        console.log('To re-process, delete scripts/.progress.json and run again.');
+        return;
+      }
       if (!fs.existsSync(progress.sourceFile)) {
         console.error(`Saved PDF no longer exists: ${progress.sourceFile}`);
         console.error('Update pdfPaths in scripts/config.json and run again.');
